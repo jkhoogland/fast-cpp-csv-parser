@@ -40,10 +40,14 @@
 #include <cstdio>
 #include <exception>
 #ifndef CSV_IO_NO_THREAD
-#include <future>
+#include <mutex>
+#include <thread>
+#include <condition_variable>
 #endif
+#include <memory>
 #include <cassert>
 #include <cerrno>
+#include <istream>
 
 namespace io{
         ////////////////////////////////////////////////////////////////////////////
@@ -129,13 +133,192 @@ namespace io{
                 };
         }
 
+        class ByteSourceBase{
+        public:
+                virtual int read(char*buffer, int size)=0;
+                virtual ~ByteSourceBase(){}
+        };
+
+        namespace detail{
+
+                class OwningStdIOByteSourceBase : public ByteSourceBase{
+                public:
+                        explicit OwningStdIOByteSourceBase(FILE*file):file(file){
+                                // Tell the std library that we want to do the buffering ourself.
+                                std::setvbuf(file, 0, _IONBF, 0);
+                        }
+
+                        int read(char*buffer, int size){
+                                return std::fread(buffer, 1, size, file);
+                        }
+
+                        ~OwningStdIOByteSourceBase(){
+                                std::fclose(file);
+                        }
+
+                private:
+                        FILE*file;
+                };
+
+                class NonOwningIStreamByteSource : public ByteSourceBase{
+                public:
+                        explicit NonOwningIStreamByteSource(std::istream&in):in(in){}
+
+                        int read(char*buffer, int size){
+                                in.read(buffer, size);
+                                return in.gcount();
+                        }
+
+                        ~NonOwningIStreamByteSource(){}
+
+                private:
+                       std::istream&in;
+                };
+
+                class NonOwningStringByteSource : public ByteSourceBase{
+                public:
+                        NonOwningStringByteSource(const char*str, long long size):str(str), remaining_byte_count(size){}
+
+                        int read(char*buffer, int desired_byte_count){
+                                int to_copy_byte_count = desired_byte_count;
+                                if(remaining_byte_count < to_copy_byte_count)
+                                        to_copy_byte_count = remaining_byte_count;
+                                std::memcpy(buffer, str, to_copy_byte_count);
+                                remaining_byte_count -= to_copy_byte_count;
+                                str += to_copy_byte_count;
+                                return to_copy_byte_count;
+                        }
+
+                        ~NonOwningStringByteSource(){}
+
+                private:
+                        const char*str;
+                        long long remaining_byte_count;
+                };
+
+                #ifndef CSV_IO_NO_THREAD
+                class AsynchronousReader{
+                public:
+                        void init(std::unique_ptr<ByteSourceBase>arg_byte_source){
+                                std::unique_lock<std::mutex>guard(lock);
+                                byte_source = std::move(arg_byte_source);
+                                desired_byte_count = -1;
+                                termination_requested = false;
+                                worker = std::thread(
+                                        [&]{
+                                                std::unique_lock<std::mutex>guard(lock);
+                                                try{
+                                                        for(;;){
+                                                                read_requested_condition.wait(
+                                                                        guard, 
+                                                                        [&]{
+                                                                                return desired_byte_count != -1 || termination_requested;
+                                                                        }
+                                                                );
+                                                                if(termination_requested)
+                                                                        return;
+
+                                                                read_byte_count = byte_source->read(buffer, desired_byte_count);
+                                                                desired_byte_count = -1;
+                                                                if(read_byte_count == 0)
+                                                                        break;
+                                                                read_finished_condition.notify_one();
+                                                        }
+                                                }catch(...){
+                                                        read_error = std::current_exception();
+                                                }
+                                                read_finished_condition.notify_one();
+                                        }
+                                );
+                        }
+
+                        bool is_valid()const{
+                                return byte_source != 0;
+                        }
+
+                        void start_read(char*arg_buffer, int arg_desired_byte_count){
+                                std::unique_lock<std::mutex>guard(lock);
+                                buffer = arg_buffer;
+                                desired_byte_count = arg_desired_byte_count;
+                                read_byte_count = -1;
+                                read_requested_condition.notify_one();
+                        }
+
+                        int finish_read(){
+                                std::unique_lock<std::mutex>guard(lock);
+                                read_finished_condition.wait(
+                                        guard, 
+                                        [&]{
+                                                return read_byte_count != -1 || read_error;
+                                        }
+                                );
+                                if(read_error)
+                                        std::rethrow_exception(read_error);
+                                else
+                                        return read_byte_count;
+                        }
+
+                        ~AsynchronousReader(){
+                                if(byte_source != 0){
+                                        {
+                                                std::unique_lock<std::mutex>guard(lock);
+                                                termination_requested = true;
+                                        }
+                                        read_requested_condition.notify_one();
+                                        worker.join();
+                                }
+                        }
+
+                private:           
+                        std::unique_ptr<ByteSourceBase>byte_source;
+
+                        std::thread worker;
+
+                        bool termination_requested;
+                        std::exception_ptr read_error;
+                        char*buffer;
+                        int desired_byte_count;
+                        int read_byte_count;
+
+                        std::mutex lock;
+                        std::condition_variable read_finished_condition;
+                        std::condition_variable read_requested_condition;  
+                };
+                #endif
+
+                class SynchronousReader{
+                public:
+                        void init(std::unique_ptr<ByteSourceBase>arg_byte_source){
+                                byte_source = std::move(arg_byte_source);
+                        }
+
+                        bool is_valid()const{
+                                return byte_source != 0;
+                        }
+
+                        void start_read(char*arg_buffer, int arg_desired_byte_count){
+                                buffer = arg_buffer;
+                                desired_byte_count = arg_desired_byte_count;
+                        }
+
+                        int finish_read(){
+                                return byte_source->read(buffer, desired_byte_count);
+                        }
+                private:
+                        std::unique_ptr<ByteSourceBase>byte_source;
+                        char*buffer;
+                        int desired_byte_count;
+                };
+        }
+
         class LineReader{
         private:
                 static const int block_len = 1<<24;
-                #ifndef CSV_IO_NO_THREAD
-                std::future<int>bytes_read;
+                #ifdef CSV_IO_NO_THREAD
+                detail::SynchronousReader reader;
+                #else
+                detail::AsynchronousReader reader;
                 #endif
-                FILE*file;
                 char*buffer;
                 int data_begin;
                 int data_end;
@@ -143,10 +326,10 @@ namespace io{
                 char file_name[error::max_file_name_length+1];
                 unsigned file_line;
 
-                void open_file(const char*file_name){
+                static std::unique_ptr<ByteSourceBase> open_file(const char*file_name){
                         // We open the file in binary mode as it makes no difference under *nix
                         // and under Windows we handle \r\n newlines ourself.
-                        file = std::fopen(file_name, "rb");
+                        FILE*file = std::fopen(file_name, "rb");
                         if(file == 0){
                                 int x = errno; // store errno as soon as possible, doing it after constructor call can fail.
                                 error::can_not_open_file err;
@@ -154,35 +337,29 @@ namespace io{
                                 err.set_file_name(file_name);
                                 throw err;
                         }
+                        return std::unique_ptr<ByteSourceBase>(new detail::OwningStdIOByteSourceBase(file));
                 }
 
-                void init(){
+                void init(std::unique_ptr<ByteSourceBase>byte_source){
                         file_line = 0;
 
-                        // Tell the std library that we want to do the buffering ourself.
-                        std::setvbuf(file, 0, _IONBF, 0);
-
+                        buffer = new char[3*block_len];
                         try{
-                                buffer = new char[3*block_len];
+                                data_begin = 0;
+                                data_end = byte_source->read(buffer, 2*block_len);
+
+                                // Ignore UTF-8 BOM
+                                if(data_end >= 3 && buffer[0] == '\xEF' && buffer[1] == '\xBB' && buffer[2] == '\xBF')
+                                        data_begin = 3;
+
+                                if(data_end == 2*block_len){
+                                        reader.init(std::move(byte_source));
+                                        reader.start_read(buffer + 2*block_len, block_len);
+                                }
                         }catch(...){
-                                std::fclose(file);
+                                delete[]buffer;
                                 throw;
                         }
-
-                        data_begin = 0;
-                        data_end = std::fread(buffer, 1, 2*block_len, file);
-
-                        // Ignore UTF-8 BOM
-                        if(data_end >= 3 && buffer[0] == '\xEF' && buffer[1] == '\xBB' && buffer[2] == '\xBF')
-                                data_begin = 3;
-
-                        #ifndef CSV_IO_NO_THREAD
-                        if(data_end == 2*block_len){
-                                bytes_read = std::async(std::launch::async, [=]()->int{
-                                        return std::fread(buffer + 2*block_len, 1, block_len, file);
-                                });
-                        }
-                        #endif
                 }
 
         public:
@@ -190,28 +367,54 @@ namespace io{
                 LineReader(const LineReader&) = delete;
                 LineReader&operator=(const LineReader&) = delete;
 
-                LineReader(const char*file_name, FILE*file):
-                        file(file){
-                        set_file_name(file_name);
-                        init();
-                }
-
-                LineReader(const std::string&file_name, FILE*file):
-                        file(file){
-                        set_file_name(file_name.c_str());
-                        init();
-                }
-
                 explicit LineReader(const char*file_name){
                         set_file_name(file_name);
-                        open_file(file_name);
-                        init();
+                        init(open_file(file_name));
                 }
 
                 explicit LineReader(const std::string&file_name){
                         set_file_name(file_name.c_str());
-                        open_file(file_name.c_str());
-                        init();
+                        init(open_file(file_name.c_str()));
+                }
+
+                LineReader(const char*file_name, std::unique_ptr<ByteSourceBase>byte_source){
+                        set_file_name(file_name);
+                        init(std::move(byte_source));
+                }
+
+                LineReader(const std::string&file_name, std::unique_ptr<ByteSourceBase>byte_source){
+                        set_file_name(file_name.c_str());
+                        init(std::move(byte_source));
+                }
+
+                LineReader(const char*file_name, const char*data_begin, const char*data_end){
+                        set_file_name(file_name);
+                        init(std::unique_ptr<ByteSourceBase>(new detail::NonOwningStringByteSource(data_begin, data_end-data_begin)));
+                }
+
+                LineReader(const std::string&file_name, const char*data_begin, const char*data_end){
+                        set_file_name(file_name.c_str());
+                        init(std::unique_ptr<ByteSourceBase>(new detail::NonOwningStringByteSource(data_begin, data_end-data_begin)));
+                }
+
+                LineReader(const char*file_name, FILE*file){
+                        set_file_name(file_name);
+                        init(std::unique_ptr<ByteSourceBase>(new detail::OwningStdIOByteSourceBase(file)));
+                }
+
+                LineReader(const std::string&file_name, FILE*file){
+                        set_file_name(file_name.c_str());
+                        init(std::unique_ptr<ByteSourceBase>(new detail::OwningStdIOByteSourceBase(file)));
+                }
+
+                LineReader(const char*file_name, std::istream&in){
+                        set_file_name(file_name);
+                        init(std::unique_ptr<ByteSourceBase>(new detail::NonOwningIStreamByteSource(in)));
+                }
+
+                LineReader(const std::string&file_name, std::istream&in){
+                        set_file_name(file_name.c_str());
+                        init(std::unique_ptr<ByteSourceBase>(new detail::NonOwningIStreamByteSource(in)));
                 }
 
                 void set_file_name(const std::string&file_name){
@@ -248,22 +451,11 @@ namespace io{
                                 std::memcpy(buffer, buffer+block_len, block_len);
                                 data_begin -= block_len;
                                 data_end -= block_len;
-                                #ifndef CSV_IO_NO_THREAD
-                                if(bytes_read.valid())
-                                #endif
+                                if(reader.is_valid())
                                 {
-                                        #ifndef CSV_IO_NO_THREAD
-                                        data_end += bytes_read.get();
-                                        #else
-                                        data_end += std::fread(buffer + 2*block_len, 1, block_len, file);
-                                        #endif
+                                        data_end += reader.finish_read();
                                         std::memcpy(buffer+block_len, buffer+2*block_len, block_len);
-
-                                        #ifndef CSV_IO_NO_THREAD
-                                        bytes_read = std::async(std::launch::async, [=]()->int{
-                                                return std::fread(buffer + 2*block_len, 1, block_len, file);
-                                        });
-                                        #endif
+                                        reader.start_read(buffer + 2*block_len, block_len);
                                 }
                         }
 
@@ -298,16 +490,10 @@ namespace io{
                 }
 
                 ~LineReader(){
-                        #ifndef CSV_IO_NO_THREAD
-                        // GCC needs this or it will crash.
-                        if(bytes_read.valid())
-                                bytes_read.get();
-                        #endif
-
                         delete[] buffer;
-                        std::fclose(file);
                 }
         };
+
 
         ////////////////////////////////////////////////////////////////////////////
         //                                 CSV                                    //
